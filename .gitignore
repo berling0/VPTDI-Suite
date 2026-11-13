@@ -1,0 +1,6 @@
+*.exe
+*.bin
+*.Original
+*.Stage1
+*.Stage2
+node_modules/
