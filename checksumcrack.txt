@@ -1,0 +1,7 @@
+How we cracked it (the breakthrough chain)
+
+1. ECM Titanium's ecm.db → MD5-matched your files to driver CKS_FAM=1 → config CHK001.CFG (gave the exact region + seeds).
+2. Ghidra (via REA) fully decompiled EcmAlgoDLL.dll → found the real compute function and all helpers.
+3. Live oracle — the DLL is a Borland C++Builder build (this-pointer in EAX); it 
+   loads in 32-bit Python with no dongle, so I called the compute function directly and got a 
+   first-try exact match, which pinned the inputs and exposed the one bug in the hand-port (a rotate-right I'd written as rotate-left).

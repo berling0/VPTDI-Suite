@@ -15,7 +15,7 @@ What it does
   - It does NOT correct the block checksums (algorithm unknown). After editing, fix them in your flashing tool / WinOLS.
 
 Build (Go 1.24+, nothing else needed):
-  build.bat            (or:  go build -trimpath -ldflags "-s -w -H windowsgui" -o MSA15Editor.exe .)
+  build.bat            (or:  go build -trimpath -ldflags "-s -w -H windowsgui" -o "VAG VPTDI.exe" .)
 
 Files
   web/core.js     all ECU logic: merge/split, map finder, naming, constants, compare
