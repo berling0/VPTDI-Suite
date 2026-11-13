@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-//go:embed web
+//go:embed docs
 var webFS embed.FS
 
 var (
@@ -28,7 +28,7 @@ var (
 const idleLimit = 3 * time.Minute // browsers slow down timers of minimised windows, so be generous
 
 func main() {
-	sub, err := fs.Sub(webFS, "web")
+	sub, err := fs.Sub(webFS, "docs")
 	if err != nil {
 		fatal(err.Error())
 	}
