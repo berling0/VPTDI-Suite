@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  pages: read
   pages: write
   id-token: write
 
@@ -26,6 +27,8 @@ jobs:
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - name: Upload web folder
         uses: actions/upload-pages-artifact@v3
