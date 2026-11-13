@@ -135,13 +135,47 @@
   }
   function rawData(bin, m) {
     const n = m.n1 * m.n2, d = new Array(n);
-    for (let k = 0; k < n; k++) d[k] = w16(bin, m.dataAddr + 2 * k);
+    for (let k = 0; k < n; k++) {
+      if (m.byte) d[k] = bin[m.dataAddr + k];
+      else { const o = m.dataAddr + 2 * k; d[k] = m.be ? ((bin[o] << 8) | bin[o + 1]) : w16(bin, o); }
+    }
     return d;
   }
   function values(bin, m) {      // rows = axis 1, columns = axis 2
     const raw = rawData(bin, m), rows = [];
     for (let r = 0; r < m.n1; r++) { const row = []; for (let c = 0; c < m.n2; c++) { const v = raw[r * m.n2 + c]; row.push(m.signed ? s16(v) : v); } rows.push(row); }
     return rows;
+  }
+
+  // Early EDC1.3.3/MSA12 calibration tables are byte-packed and do not have
+  // the MSA15 RAM-axis headers. These are the common 1Z/90 hp table locations
+  // documented for the 64 KiB family; only add a table when its full byte
+  // range is present and it is not an erased/filler region.
+  const MSA12_MAPS = [
+    { addr: 0x659A, name: 'MAP sensor linearisation', n1: 1, n2: 16, q1: 'mv', dq: 'mbar' },
+    { addr: 0x6996, name: 'Torque limiter', n1: 19, n2: 1, q1: 'rpm', dq: 'iq12' },
+    { addr: 0x6D26, name: 'MAP correction', n1: 16, n2: 1, q1: 'boost', dq: 'factor' },
+    { addr: 0x6E12, name: 'Start of injection (1)', n1: 8, n2: 8, q1: 'temp', q2: 'iq12', dq: 'soi' },
+    { addr: 0x6F22, name: 'Start of injection (2)', n1: 8, n2: 8, q1: 'temp', q2: 'iq12', dq: 'soi' },
+    { addr: 0x7224, name: 'N146 Pump voltage map', n1: 14, n2: 16, q1: 'rpm', q2: 'iq12', dq: 'pump' },
+    { addr: 0x741A, name: 'Drivers wish', n1: 8, n2: 12, q1: 'rpm', q2: 'pedal', dq: 'iq12' },
+    { addr: 0x7620, name: 'Smoke limiter', n1: 10, n2: 16, q1: 'rpm', q2: 'maf', dq: 'iq12' },
+    { addr: 0x7716, name: 'Start IQ', n1: 8, n2: 8, q1: 'temp', q2: 'iq12', dq: 'iq12' },
+    { addr: 0x7822, name: 'Inverse driver wish', n1: 8, n2: 12, q1: 'rpm', q2: 'iq12', dq: 'pedal' }
+  ];
+  function findMSA12Maps(bin) {
+    const maps = [];
+    for (const s of MSA12_MAPS) {
+      const end = s.addr + s.n1 * s.n2;
+      if (end > bin.length) continue;
+      const d = bin.slice(s.addr, end);
+      let same = true; for (let i = 1; i < d.length; i++) if (d[i] !== d[0]) { same = false; break; }
+      if (same || d.every(v => v === 0xFF)) continue;
+      const m = Object.assign({ addr: s.addr, dataAddr: s.addr, end, id1: null, id2: null, n1: s.n1, n2: s.n2, ax1: [], ax2: [], byte: true, identified: true, sure: true, source: 'MSA12 map references' }, s);
+      m.min = Math.min(...d); m.max = Math.max(...d); m.flat = m.min === m.max; m.dq = s.dq || null;
+      maps.push(m);
+    }
+    return maps;
   }
 
   // ---------- naming ----------
@@ -152,6 +186,7 @@
     atm: { name: 'Atmospheric pressure', unit: 'mbar', f: 1, off: 0, dec: 0 },
     maf: { name: 'Air mass', unit: 'mg/stroke', f: 0.1, off: 0, dec: 0 },
     iq: { name: 'Injection quantity', unit: 'mg/stroke', f: 0.01, off: 0, dec: 1 },
+    iq12: { name: 'Injection quantity (MSA12)', unit: 'mg/stroke', f: 0.2, off: 0, dec: 1 },
     mbar: { name: 'Pressure', unit: 'mbar', f: 1, off: 0, dec: 0 },
     boost: { name: 'Boost pressure', unit: 'mbar', f: 1, off: 0, dec: 0 },
     dev: { name: 'Boost control deviation ?', unit: 'mbar', f: 1, off: 0, dec: 0 },
@@ -161,7 +196,9 @@
     factor: { name: 'Factor', unit: '%', f: 0.01, off: 0, dec: 1 },
     mafraw: { name: 'MAF sensor signal', unit: 'raw', f: 1, off: 0, dec: 0 },
     soi: { name: 'Start of injection', unit: 'raw', f: 1, off: 0, dec: 0 },
-    pump: { name: 'Pump voltage', unit: 'raw', f: 1, off: 0, dec: 0 },
+    // N146 pump-voltage tables store an ADC/DAC command in raw units. The
+    // verified software variants use approximately 1.221 mV per count.
+    pump: { name: 'N146 pump voltage', unit: 'mV', f: 1.221, off: 0, dec: 0 },
     gain: { name: 'Controller gain', unit: 'raw', f: 1, off: 0, dec: 0 },
     corr: { name: 'Correction', unit: 'raw', f: 1, off: 0, dec: 0 },
     time: { name: 'Time', unit: 'raw', f: 1, off: 0, dec: 0 },
@@ -176,7 +213,16 @@
     if (id === null) return null;
     if (id === rpmId) return 'rpm';
     if (v.length >= 2 && v[0] >= 2231 && v[v.length - 1] <= 4231) return 'temp';
-    return KNOWN_IDS[ALIAS[id] || id] || null;
+    const known = KNOWN_IDS[ALIAS[id] || id];
+    if (known) return known;
+    // Axis addresses move between the early MSA15 software generations.  The
+    // physical ranges are stable, however, and are a safer fallback than
+    // displaying every shifted address as "var Cxxx".
+    if (v.length >= 6 && v[0] === 0 && v[v.length - 1] === 10000) return 'pedal';
+    if (v.length >= 8 && v[0] >= 0 && v[v.length - 1] <= 5200) return 'iq';
+    if (v.length >= 8 && v[0] >= 700 && v[v.length - 1] <= 2800) return 'boost';
+    if (v.length >= 8 && v[0] >= 2000 && v[v.length - 1] <= 12000) return 'maf';
+    return null;
   }
   // Built-in map list. Sources: the user's map pack for 0281001656 / 028906021GL, and the forum map lists for
   // 038906018P / 0281001720 (checked against dump_ori.bin). A map is recognised by its two axis variables, its
@@ -225,7 +271,20 @@
     { name: 'IQ to Airmass', id1: E, id2: 0xDEDC, n1: 16, n2: 10, ord: 1, q2: 'iq', dq: 'maf' }
   ];
   // The same variable carries a different id in some software versions (P-family vs G-family).
-  const ALIAS = { 0xC2A2: 0xC2A0, 0xC2D4: 0xC2D0 };
+  // Known relocations of the same logical RAM variables.  The first two are
+  // used by the P/AS and GH/GS generations; the others occur in the older
+  // BF/BD and later BL/BM images supplied with the project.  Unknown IDs are
+  // still handled by the range-based axis classifier above.
+  const ALIAS = {
+    0xC2A2: 0xC2A0, 0xC2D4: 0xC2D0,
+    0xC2AC: 0xC2A0, 0xC2D8: 0xC2D0, 0xC2F0: 0xC2D0,
+    0xC2BE: 0xC2A0, 0xC2FE: 0xC2A0,
+    0xC2AE: 0xC2A0, 0xC2FA: 0xC2A0,
+    0xC238: 0xC22E, 0xC264: 0xC22E,
+    0xC1F2: 0xC1D0, 0xC1F4: 0xC1D0,
+    0xC21C: 0xC210, 0xC244: 0xC210,
+    0xC262: 0xDC16
+  };
   const nid = id => (id === null ? null : ALIAS[id] || id);
   const sigMatch = (m, sg) => nid(m.id1) === sg.id1 && nid(m.id2) === sg.id2 && m.n1 === sg.n1 && (!sg.n2 || m.n2 === sg.n2) && (!sg.v || (m.min >= sg.v[0] && m.max <= sg.v[1]));
   const within = (a, lo, hi) => a.length > 0 && a[0] >= lo && a[a.length - 1] <= hi;
@@ -245,7 +304,10 @@
       if (!m || m.name) continue;
       m.name = sg.name; m.sure = true; m.source = 'pack'; m.dq = sg.dq || null; if (sg.q1) m.q1 = sg.q1; if (sg.q2) m.q2 = sg.q2; hits++;
     }
-    if (!hits) heuristicNames(maps);     // unknown software: recognise the main maps by their shape instead
+    // Keep the signature names, but also run the shape recogniser for every
+    // dump.  A partial signature match is normal in the other MSA15
+    // generations and must not suppress recognition of the remaining maps.
+    heuristicNames(maps);
     for (const m of maps) {
       delete m.d;
       m.identified = !!m.name;
@@ -257,9 +319,27 @@
   function heuristicNames(maps) {
     const count = {};
     for (const m of maps) {
+      if (m.name) continue; // signature names are more specific than shape guesses
       const is3d = m.id2 !== null, a1 = m.ax1, a2 = m.ax2, min = m.min, max = m.max;
       let name = null;
-      if (is3d && m.q1 === 'rpm' && m.n1 >= 12 && m.n2 >= 6 && m.n2 <= 10 && a2[a2.length - 1] === 10000 && a2[0] >= 0 && max >= 3000 && max <= 6500) {
+      // Torque limiter identification is value/axis based.  Some early
+      // MSA15.5 files use a 16x16 RPM x IQ table instead of the later
+      // 3x25-style table.  The limiter output has a high torque-value range,
+      // while its first RPM rows contain a lower plateau followed by a higher
+      // plateau.  Empty zero-filled tables (for example in BD originals) do
+      // not pass this test and must not be offered as a hardcut target.
+      const torque16 = is3d && m.q1 === 'rpm' && m.q2 === 'iq' && m.n1 === 16 && m.n2 === 16 &&
+        a1[a1.length - 1] >= 4000 && a2[a2.length - 1] >= 3000 && min >= 2500 && max >= 6500 && max <= 9000 &&
+        m.d.slice(0, m.n2).some(v => v >= 3000 && v <= 5000) &&
+        m.d.slice(m.n2, Math.min(m.d.length, 5 * m.n2)).some(v => v >= 6500);
+      if (torque16) {
+        name = 'Torque limiter'; m.dq = 'iq'; m.sure = true;
+      } else if (is3d && m.q1 === 'rpm' && m.n1 === 16 && m.n2 === 8 && a2[0] <= 100 && a2[a2.length - 1] >= 8000 && min >= 0 && max >= 4500 && max <= 7000) {
+        // Some EDC15V manuals store Drivers Wish as 16x8 with a private
+        // second-axis ID (for example C1D8), instead of the recognised pedal
+        // axis ID used by the automatic software block.
+        name = 'Drivers wish'; m.q2 = 'pedal'; m.dq = 'iq'; m.sure = true;
+      } else if (is3d && m.q1 === 'rpm' && m.n1 >= 12 && m.n2 >= 6 && m.n2 <= 10 && a2[a2.length - 1] === 10000 && a2[0] >= 0 && max >= 3000 && max <= 6500) {
         name = 'Drivers wish'; m.q2 = 'pedal'; m.dq = 'iq'; m.sure = true;
       } else if (is3d && m.n1 <= 4 && within(a1, 400, 1200) && m.q2 === 'rpm' && m.n2 >= 12 && max >= 2000 && max <= 6000) {
         name = 'Torque limiter'; m.q1 = 'atm'; m.dq = 'iq'; m.sure = true;
@@ -309,7 +389,9 @@
   };
   const mk = (key, name, off, fmt, unit, def, inferred) => ({ key, name, off, fmt, unit, def, note: C_NOTE[key.replace(/\d+$/, '')] || '', inferred: !!inferred });
   const FAMILIES = [
-    { id: 'P', name: '038906018P / 0281001720', re: /^038906018/, consts: [
+    // These offsets are verified for the P/N software layout only.  Other
+    // 038906018 variants (notably J/BM) have different constant locations.
+    { id: 'P', name: '038906018P / 0281001720', re: /^038906018(?:P|N|AS)$/, consts: [
       mk('coding', 'Engine coding digit (map set)', 0x11E4, 'u16', 'raw'), mk('sw', 'MAF/MAP smoke limiter switch', 0x11DC, 'u16', 'hex', 0),
       mk('iqmax', 'Max IQ limit', 0x2D95, 'u8', 'iq', 51), mk('smokemax', 'Smoke limiter max IQ', 0x2E01, 'u8', 'iq', 51),
       mk('wishmax', 'Driver wish max IQ', 0x2DC1, 'u8', 'iq', 51), mk('tqmax', 'Torque limiter max IQ', 0x2E19, 'u8', 'iq', 51),
@@ -331,7 +413,8 @@
       { key: 'idlec', name: 'RPM constant (0x64D0)', off: 0x64D0, fmt: 'u16', unit: 'rpm', note: 'One of four further RPM constants' },
       { key: 'idled', name: 'RPM constant (0x6516)', off: 0x6516, fmt: 'u16', unit: 'rpm', note: 'One of four further RPM constants' }
     ] },
-    { id: 'G', name: '028906021GK / GL', re: /^028906021G/, consts: [
+    // GH/JG share the verified G-family constant layout; GS/FS/FQ do not.
+    { id: 'G', name: '028906021GK / GL', re: /^028906021(?:GK|GL|GH|JG)$/, consts: [
       mk('coding', 'Engine coding digit (map set)', 0x11D6, 'u16', 'raw'), mk('sw', 'MAF/MAP smoke limiter switch', 0x11CE, 'u16', 'hex', 0, true),
       mk('iqmax', 'Max IQ limit', 0x2E4F, 'u8', 'iq', 51), mk('smokemax', 'Smoke limiter max IQ', 0x2EBB, 'u8', 'iq', 51),
       mk('wishmax', 'Driver wish max IQ', 0x2E7B, 'u8', 'iq', 51), mk('tqmax', 'Torque limiter max IQ', 0x2ED3, 'u8', 'iq', 51),
@@ -344,6 +427,65 @@
       mk('boostlim', 'Single-value boost limiter', 0x52BC, 'u16', 'mbar')
     ] }
   ];
+  // BM and J use the same four one-byte IQ caps and MAP configuration
+  // meanings, but their code-generation offsets are different from P.  Keep
+  // this profile deliberately narrow until the remaining single-value
+  // locations are verified; this enables Max IQ and 3-bar safely without
+  // inventing values for unrelated constants.
+  const pConst = FAMILIES[0].consts;
+  const profile = (id, name, re, offsets) => ({
+    id, name, re,
+    consts: Object.keys(offsets).map(key => {
+      const base = pConst.find(c => c.key === key);
+      return Object.assign({}, base, { off: offsets[key] });
+    })
+  });
+  FAMILIES.push(
+    profile('BM', '038906018BM', /^038906018BM$/, {
+      iqmax: 0x2FBB, smokemax: 0x3027, wishmax: 0x2FE7, tqmax: 0x303F,
+      mapfac: 0x2E28, pcfg1: 0x2FCA, pcfg2: 0x2FCE, pcfg3: 0x2FF6
+    }),
+    profile('BT', '038906018BT', /^038906018BT$/, {
+      iqmax: 0x2FBB, smokemax: 0x3027, wishmax: 0x2FE7, tqmax: 0x303F,
+      mapfac: 0x2E28, pcfg1: 0x2FCA, pcfg2: 0x2FCE, pcfg3: 0x2FF6
+    }),
+    profile('J', '038906018J', /^038906018J$/, {
+      iqmax: 0x2D7B, smokemax: 0x2DE7, wishmax: 0x2DA7, tqmax: 0x2DFF,
+      mapfac: 0x2C16, pcfg1: 0x2D8A, pcfg2: 0x2D8E, pcfg3: 0x2DB6
+    }),
+    profile('AN', '038906018AN', /^038906018AN$/, {
+      iqmax: 0x2D7B, smokemax: 0x2DE7, wishmax: 0x2DA7, tqmax: 0x2DFF,
+      mapfac: 0x2C16, pcfg1: 0x2D8A, pcfg2: 0x2D8E, pcfg3: 0x2DB6
+    }),
+    profile('AE', '038906018AE', /^038906018AE$/, {
+      iqmax: 0x2FBB, smokemax: 0x3027, wishmax: 0x2FE7, tqmax: 0x303F,
+      mapfac: 0x2E28, pcfg1: 0x2FCA, pcfg2: 0x2FCE, pcfg3: 0x2FF6
+    }),
+    profile('D', '038906018D', /^038906018D$/, {
+      iqmax: 0x2D7B, smokemax: 0x2DE7, wishmax: 0x2DA7, tqmax: 0x2DFF,
+      pbm: 0x1276, siga: 0x1994, sigaconv: 0x1996, sigaper: 0x1998,
+      sigamax: 0x199A, sigadisp: 0x199C, diagfac: 0x2C22,
+      mapfac: 0x2C16, pcfg1: 0x2D8A, pcfg2: 0x2D8E, pcfg3: 0x2DB6
+    }),
+    profile('BL', '038906018BL', /^038906018BL$/, {
+      iqmax: 0x2FBB, smokemax: 0x3027, wishmax: 0x2FE7, tqmax: 0x303F,
+      siga: 0x1A2E, sigaconv: 0x1A30, sigaper: 0x1A32, sigamax: 0x1A34,
+      sigadisp: 0x1A36, diagfac: 0x2E34,
+      mapfac: 0x2E28, pcfg1: 0x2FCA, pcfg2: 0x2FCE, pcfg3: 0x2FF6
+    }),
+  profile('BD', '028906021BD', /^028906021BD$/, {
+      iqmax: 0x3043, smokemax: 0x30AF, wishmax: 0x306F, tqmax: 0x30C7,
+      mapfac: 0x2EC6, pcfg1: 0x3052, pcfg2: 0x3056, pcfg3: 0x307E
+    }),
+    profile('EM', '028906021EM', /^028906021EM$/, {
+      iqmax: 0x3043, smokemax: 0x30AF, wishmax: 0x306F, tqmax: 0x30C7,
+      mapfac: 0x2EC6, pcfg1: 0x3052, pcfg2: 0x3056, pcfg3: 0x307E
+    }),
+    profile('GM', '028906021GM', /^028906021GM$/, {
+      iqmax: 0x2E4F, smokemax: 0x2EBB, wishmax: 0x2E7B, tqmax: 0x2ED3,
+      mapfac: 0x2CD2, pcfg1: 0x2E5E, pcfg2: 0x2E62, pcfg3: 0x2E8A
+    })
+  );
   function familyOf(info) {
     const part = info && info.ident ? info.ident.part : '';
     return FAMILIES.find(f => f.re.test(part)) || null;
@@ -404,11 +546,35 @@
         return { addr: s.addr, text: t.trim(), part, bosch, gear, sw, engine };
       }
     }
+    // Early 64 KiB EDC1.3.3/MSA12 images store the identification fields as
+    // short ASCII fragments separated by 0x00/0xFF bytes, so the normal long
+    // printable-string scan cannot see them as one string.
+    if (end - start <= 0x10000) {
+      let text = '';
+      for (let i = start; i < end; i++) text += bin[i] >= 0x20 && bin[i] < 0x7F ? String.fromCharCode(bin[i]) : ' ';
+      const pm = text.match(/(\d{3}906\d{3}[A-Z]{0,2})/);
+      if (pm) {
+        const at = text.indexOf(pm[1]);
+        const around = text.slice(Math.max(0, at - 16), at + 180).replace(/\s+/g, ' ').trim();
+        const gear = (around.match(/\b(SG|AG)\b/) || [null, ''])[1];
+        const sw = (around.match(/\b(?:SG|AG)\s+(\d{4})\b/) || [null, ''])[1];
+        const engine = (around.match(/\d,\dl\s+\S+/) || [''])[0];
+        return { addr: start + at, text: around, part: pm[1], bosch: '', gear, sw, engine };
+      }
+    }
+    return null;
+  }
+  function ecuTypeOf(info) {
+    const part = info && info.ident ? info.ident.part : '';
+    if (info && info.size === 0x10000 && /^028906021/.test(part)) return 'EDC MSA12 / EDC1.3.3';
+    if (/^03890601(?:3|8)/.test(part)) return 'EDC15V';
+    if (info && info.size === 0x40000 && /^028906021/.test(part)) return 'MSA15.5';
+    if (info && info.size === 0x40000 && /^03890601(?:3|8)/.test(part)) return 'EDC15V';
     return null;
   }
   const sum = (b, mask) => { let s = 0; for (let i = 0; i < b.length; i++) s = (s + b[i]) >>> 0; return mask ? s & mask : s; };
 
-  function analyze(bin) {
+  function analyzeCore(bin) {
     const blocks = [];
     for (let s = 0; s + BLOCK <= bin.length; s += BLOCK) {
       const r = findInRange(bin, s, s + BLOCK);
@@ -431,23 +597,57 @@
     }
     const chips = bin.length % 2 === 0 ? split(bin) : null;
     const ident = blocks.map(b => b.ident).find(Boolean) || identOf(bin, 0, bin.length);
+    if (!blocks.length && bin.length === 0x10000 && (!ident || /^028906021/.test(ident.part))) {
+      const maps = findMSA12Maps(bin);
+      if (maps.length) {
+        maps.forEach((m, i) => { m.block = 0; m.index = i; });
+        blocks.push({ start: 0, end: bin.length, label: 'MSA12 · 8-bit calibration', cb: 'MSA12', ident, maps, rpmId: null, coding: null, stored: '' });
+      }
+    }
     const fam = FAMILIES.find(f => f.re.test(ident ? ident.part : ''));
     const cc = fam && fam.consts.find(c => c.key === 'coding');
     for (const b of blocks) b.coding = cc ? readConst(bin, b.start, cc) : null;
     const warnings = [];
     if (bin.length !== 0x40000) warnings.push('File is ' + bin.length + ' bytes. A full MSA15.5 dump (2 × 128 KB chips) is 262144 bytes.');
+    if (bin.length === 0x10000 && ident && /^028906021/.test(ident.part)) warnings.push('This is a 64 KiB EDC MSA12 / EDC1.3.3 image; its byte-packed maps are shown with the MSA12 decoder.');
     if (!blocks.length) warnings.push('No map data block was found. This does not look like a combined (interleaved) MSA15.5 file.');
     if (chips && chipMarker(chips.L) === 'H' && chipMarker(chips.H) === 'L') warnings.push('The chip tags are swapped: this file looks like it was merged with HHH and LLL the wrong way round.');
     return {
-      size: bin.length, blocks, ident, warnings, family: fam ? fam.name : null,
+      size: bin.length, blocks, ident, ecuType: ecuTypeOf({ size: bin.length, ident }), warnings, family: fam ? fam.name : null,
       sums: { file: hex(sum(bin, 0xFFFF), 4), L: chips ? hex(sum(chips.L, 0xFFFF), 4) : '', H: chips ? hex(sum(chips.H, 0xFFFF), 4) : '' },
       mapCount: blocks.reduce((t, b) => t + b.maps.length, 0)
     };
   }
+  function endianScore(bin, be) {
+    const ids = [0xE08A, 0xC002, 0xC022, 0xC252, 0xDC18, 0xC30C, 0xDD78];
+    let n = 0;
+    for (let i = 0; i + 1 < bin.length; i += 2) {
+      const v = be ? (bin[i] << 8) | bin[i + 1] : bin[i] | (bin[i + 1] << 8);
+      if (ids.includes(v)) n++;
+    }
+    return n;
+  }
+  function swap16(bin) {
+    const out = bin.slice();
+    for (let i = 0; i + 1 < out.length; i += 2) { const t = out[i]; out[i] = out[i + 1]; out[i + 1] = t; }
+    return out;
+  }
+  function analyze(bin) {
+    const be = endianScore(bin, true) > endianScore(bin, false) * 2 && endianScore(bin, true) >= 8;
+    const info = analyzeCore(be ? swap16(bin) : bin);
+    if (be) {
+      for (const blk of info.blocks) for (const m of blk.maps) m.be = true;
+      info.endian = 'big';
+      info.warnings.push('This dump uses big-endian MSA15.5 word storage; map values are decoded and written back with that byte order.');
+    } else info.endian = 'little';
+    return info;
+  }
   // A lone chip dump (half of the words) - used to tell the user the second chip is still missing.
   function looksLikeSingleChip(bin) {
     if (countMaps(bin) >= MIN_BLOCK_MAPS) return null;
-    return chipMarker(bin) || (bin.length === 0x20000 || bin.length === 0x10000 ? '?' : null);
+    if (bin.length === 0x40000 && endianScore(bin, true) > endianScore(bin, false) * 2 && endianScore(bin, true) >= 8) return null;
+    if (bin.length === 0x10000) return 'MSA15.1';
+    return chipMarker(bin) || (bin.length === 0x20000 ? '?' : null);
   }
 
   // ---------- compare ----------
@@ -534,14 +734,20 @@
   }
   const ckHex = bytes => hex(bytes[3], 2) + hex(bytes[2], 2) + hex(bytes[0], 2) + hex(bytes[1], 2); // same layout as block.stored
   // Per-block status: stored vs. recomputed checksum. `info` comes from analyze().
-  function checksumStatus(bin, info) {
-    const supported = !!FAMILIES.find(f => f.re.test(info && info.ident ? info.ident.part : ''));
+  // A block's stored checksum matches what family-1 computes over `src`.
+  function blockOk(src, blk) { const o = blk.end - 4, w = checksumBytes(src, blk.start); return src[o] === w[0] && src[o + 1] === w[1] && src[o + 2] === w[2] && src[o + 3] === w[3]; }
+  function checksumStatus(bin, info, orig) {
     const blocks = info.blocks.map(blk => {
       const store = blk.end - 4, want = checksumBytes(bin, blk.start);
       const have = [bin[store], bin[store + 1], bin[store + 2], bin[store + 3]];
-      const ok = have[0] === want[0] && have[1] === want[1] && have[2] === want[2] && have[3] === want[3];
-      return { label: blk.label, start: blk.start, store, ok, stored: ckHex(have), computed: ckHex(want) };
+      return { label: blk.label, start: blk.start, store, ok: blockOk(bin, blk), stored: ckHex(have), computed: ckHex(want) };
     });
+    // Support is determined from the immutable dump layout, not from whether
+    // the current bytes still have a valid checksum. Editing a map naturally
+    // makes the current checksum invalid; that must produce "needs fix", not
+    // make the file become an unknown ECU. The 256 KiB size plus detected
+    // 0x8000 data blocks also rejects the supplied older ROM formats.
+    const supported = info.size === 0x40000 && blocks.length > 0 && info.endian !== 'big';
     return { supported, blocks, bad: blocks.filter(b => !b.ok).length, total: blocks.length };
   }
   // Returns a new image with every block checksum recomputed and written. Only touches the 4 bytes per block.
@@ -556,8 +762,9 @@
   }
   // Write one raw 16-bit value into a map cell (row r, column c). Mutates `bin`.
   function setValue(bin, m, r, c, raw) {
-    const o = m.dataAddr + 2 * (r * m.n2 + c), v = raw & 0xFFFF;
-    bin[o] = v & 0xFF; bin[o + 1] = (v >> 8) & 0xFF;
+    const o = m.dataAddr + (m.byte ? (r * m.n2 + c) : 2 * (r * m.n2 + c)), v = raw & 0xFFFF;
+    if (m.be && !m.byte) { bin[o] = (v >> 8) & 0xFF; bin[o + 1] = v & 0xFF; }
+    else { bin[o] = v & 0xFF; if (!m.byte) bin[o + 1] = (v >> 8) & 0xFF; }
   }
 
   // ---------- one-click tuning ----------
@@ -589,7 +796,12 @@
   // Hard-cut: on the Torque limiter map (the one that caps fuelling vs RPM), set the top of its engine-speed
   // axis to `rpm` and the breakpoint before it to rpm-20 (abrupt cut). Done in every code block.
   const isRevMap = m => /^Torque limiter/.test(m.name || '');
-  function revAxisOf(m) { return m.id2 !== null && m.n2 >= 2 ? { axis: 'col', n: m.n2 } : m.n1 >= 2 ? { axis: 'row', n: m.n1 } : null; }
+  function revAxisOf(m) {
+    if (m.id2 === null) return null;
+    if (m.q1 === 'rpm' && m.n1 >= 2) return { axis: 'row', n: m.n1 };
+    if (m.q2 === 'rpm' && m.n2 >= 2) return { axis: 'col', n: m.n2 };
+    return m.n2 >= 2 ? { axis: 'col', n: m.n2 } : m.n1 >= 2 ? { axis: 'row', n: m.n1 } : null;
+  }
   function setRevLimit(bin, info, rpm, blocks) {
     let n = 0;
     for (const blk of (blocks || info.blocks)) for (const m of blk.maps) if (isRevMap(m)) {
@@ -608,7 +820,8 @@
   // Write an axis breakpoint value ('row' = first axis, 'col' = second axis). Mutates bin and the cached map.
   function setAxisValue(bin, m, axis, k, raw) {
     const o = axis === 'col' ? (m.dataAddr - 2 * m.n2 + 2 * k) : (m.addr + 4 + 2 * k), v = raw & 0xFFFF;
-    bin[o] = v & 0xFF; bin[o + 1] = (v >> 8) & 0xFF;
+    if (m.be) { bin[o] = (v >> 8) & 0xFF; bin[o + 1] = v & 0xFF; }
+    else { bin[o] = v & 0xFF; bin[o + 1] = (v >> 8) & 0xFF; }
     if (axis === 'col') m.ax2[k] = s16(v); else m.ax1[k] = s16(v);
   }
   // 3-bar MAP sensor conversion (forum values for a 3 bar sensor).

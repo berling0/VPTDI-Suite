@@ -1,4 +1,4 @@
-/* VAG MSA15.5 Suite - user interface. All file handling happens in this window; nothing is uploaded anywhere. */
+/* VAG VPTDI - user interface. All file handling happens in this window; nothing is uploaded anywhere. */
 (function () {
   'use strict';
   const $ = id => document.getElementById(id);
@@ -6,7 +6,7 @@
   const hex = MSA.hex;
   const FORCE_DOWNLOAD = /[?&]dl=1/.test(location.search);
 
-  const S = { cur: null, ref: null, pending: null, block: 0, sel: null, mode: 'val', phys: true, cmp: null, view: 'map', viz: '2d', opv: '', cells: new Set(), anchor: null, _lastSel: null, rot: { az: -0.7, el: 0.9 }, hoverRow: null, hover3d: null };
+  const S = { cur: null, ref: null, pending: null, block: 0, sel: null, mode: 'val', phys: true, cmp: null, view: 'map', viz: '2d', opv: '', cells: new Set(), anchor: null, _lastSel: null, foldOther: {}, userOriginal: false, autoStage1Done: false, autoStage1Summary: '', autoStage1Pending: false, rot: { az: -0.7, el: 0.9 }, hoverRow: null, hover3d: null };
 
   // ---------- helpers ----------
   function banner(msg, kind) {
@@ -36,11 +36,13 @@
     if (files.length === 2) return mergeTwo(files[0], files[1]);
     const f = files[0];
     const chip = MSA.looksLikeSingleChip(f.buf);
-    if (S.pending && !forCompare && chip && S.pending.buf.length === f.buf.length) { const p = S.pending; S.pending = null; return mergeTwo(p, f); }
+    if (S.pending && !forCompare && chip && chip !== 'MSA15.1' && S.pending.buf.length === f.buf.length) { const p = S.pending; S.pending = null; return mergeTwo(p, f); }
     if (chip) {
+      if (chip === 'MSA15.1') return { name: f.name, bin: f.buf, msg: '<b>' + esc(f.name) + '</b> is a 64 KiB EDC MSA12 / EDC1.3.3 image. The detected 8-bit maps are editable; checksum correction is not available for this older format.', kind: '' };
       if (forCompare) throw new Error(esc(f.name) + ' is a single chip dump. To compare, select both chip files (LLL and HHH) together, or a combined bin.');
       S.pending = f;
-      banner('<b>' + esc(f.name) + '</b> is a single chip dump (' + kb(f.buf.length) + (chip === '?' ? '' : ', tagged <b>' + chip + '</b>') + '). Now open the other chip file and the two are merged automatically.', '');
+      if (chip === 'MSA15.1') banner('<b>' + esc(f.name) + '</b> is a 64 KiB MSA15.1/older ROM image. This editor supports 128 KiB MSA15.5 chip files or a combined 256 KiB dump.', 'err');
+      else banner('<b>' + esc(f.name) + '</b> is a single chip dump (' + kb(f.buf.length) + (chip === '?' ? '' : ', tagged <b>' + chip + '</b>') + '). Now open the other chip file and the two are merged automatically.', '');
       return null;
     }
     return { name: f.name, bin: f.buf, msg: null };
@@ -58,7 +60,16 @@
     try {
       const img = await buildImage(fileList, false);
       if (!img) return;
-      S.cur = { name: img.name, bin: img.bin, orig: img.bin.slice(), info: MSA.analyze(img.bin) };
+      const info = MSA.analyze(img.bin);
+      // Some early 64 KiB images have the ID fields split by filler bytes;
+      // recover the VAG/Bosch numbers from the supplied filename when needed.
+      if (!info.ident) {
+        const m = img.name.match(/Bosch_(0281\d{6})_(028906021[A-Z]{0,2})/i);
+        if (m) info.ident = { addr: 0, text: m[2].toUpperCase(), part: m[2].toUpperCase(), bosch: m[1], gear: '', sw: '', engine: '' };
+        if (info.ident && /^028906021/.test(info.ident.part)) info.ecuType = img.bin.length === 0x10000 ? 'EDC MSA12 / EDC1.3.3' : 'MSA15.5';
+      }
+      S.userOriginal = window.confirm('Is this an Original file?\n\nChoose Yes only for an untouched factory/original BIN. This enables Auto Stage 1.');
+      S.cur = { name: img.name, bin: img.bin, orig: img.bin.slice(), info }; S.autoStage1Done = false; S.autoStage1Summary = '';
       S.ref = null; S.cmp = null; S.block = 0; S.sel = null; S.mode = 'val'; S.cells = new Set(); S.anchor = null; S._lastSel = null;
       const w = S.cur.info.warnings;
       if (w.length) banner((img.msg ? img.msg + '<br>' : '') + w.map(esc).join('<br>'), 'err'); else banner(img.msg, img.kind);
@@ -95,7 +106,7 @@
   }
   async function saveBin() {
     try {
-      const fixed = familySupported() ? applyCorrection() : 0;
+      const fixed = checksumSupported() ? applyCorrection() : 0;
       if (fixed) render();
       const n = await saveOne(baseName(S.cur.name) + '.bin', S.cur.bin);
       if (n) toast('Saved ' + n + ' - ' + S.cur.bin.length + ' bytes' + (fixed ? ', ' + fixed + ' checksum' + (fixed > 1 ? 's' : '') + ' corrected' : '') + ', byte sum ' + S.cur.info.sums.file);
@@ -103,7 +114,7 @@
   }
   async function saveChips() {
     try {
-      const fixed = familySupported() ? applyCorrection() : 0;
+      const fixed = checksumSupported() ? applyCorrection() : 0;
       if (fixed) render();
       const { L, H } = MSA.split(S.cur.bin);
       if (!MSA.equal(MSA.merge(L, H), S.cur.bin)) throw new Error('Internal check failed: the split files do not merge back to the same image. Nothing was written.');
@@ -127,12 +138,21 @@
     $('side').style.display = has ? 'flex' : 'none';
     $('work').style.display = has ? 'flex' : 'none';
     for (const id of ['bCmp', 'bSaveBin', 'bSaveChips', 'bFix']) $(id).disabled = !has;
+    $('bSaveBin').textContent = has && S.cur.info.ecuType === 'MSA15.5' ? 'Save combined .bin' : 'Save .bin';
+    $('bSaveBin').title = has && S.cur.info.ecuType === 'MSA15.5'
+      ? 'Save the combined (interleaved) file (checksums corrected automatically)'
+      : 'Save the edited BIN file (checksums corrected automatically)';
+    // Only the dual-chip MSA15.5 format has a meaningful LLL/HHH export.
+    // EDC15V is a single-flash image, so avoid presenting a misleading split
+    // save action for it (and for the older single-image MSA12 format).
+    $('bSaveChips').style.display = has && S.cur.info.ecuType === 'MSA15.5' ? '' : 'none';
     $('fname').textContent = has ? S.cur.name + (S.ref ? '   vs   ' + S.ref.name : '') : '';
     renderCk(); renderTune();
     if (!has) return;
     const info = S.cur.info, id = info.ident;
     $('ecu').innerHTML = [
       ['VAG part no.', id ? id.part : '-'], ['Bosch no.', id ? id.bosch || '-' : '-'], ['Engine', id ? id.engine || '-' : '-'],
+      ['ECU type', info.ecuType || 'Unknown'],
       ['Software', info.blocks.map(b => (b.ident ? b.ident.gear + ' ' + b.ident.sw : '?')).join(' / ') || '-'],
       [info.blocks.some(b => b.coding !== null) ? 'Engine coding' : 'Code blocks', info.blocks.map(b => b.cb + (b.coding !== null ? '=' + b.coding : '')).join('  ')],
       ['Size', kb(info.size)], ['Maps found', info.mapCount], ['Byte sum', info.sums.file]
@@ -167,8 +187,9 @@
       (S.cmp ? '<span class="chg' + (m.changed ? '' : ' no') + '" title="changed vs reference"></span>' : '') +
       '<span class="a">' + hex(m.dataAddr, 5) + '</span><span class="n" title="' + esc(m.name) + '">' + esc(m.name) + '</span><span class="d">' + MSA.dims(m) + '</span></div>';
     const idd = blk.maps.filter(m => m.identified && match(m)), rest = blk.maps.filter(m => !m.identified && match(m));
+    const folded = !!S.foldOther[S.block] && !q;
     el.innerHTML = (idd.length ? '<div class="grp">Identified (' + idd.length + ')</div>' + idd.map(row).join('') : '') +
-      '<div class="grp">All other maps by address (' + rest.length + ')</div>' + rest.map(row).join('');
+      '<button class="grp fold" data-fold="other">' + (folded ? '▸ ' : '▾ ') + 'All other maps by address (' + rest.length + ')</button>' + (folded ? '' : rest.map(row).join(''));
     if (!S.sel || S.sel.block !== S.block) { S.sel = idd[0] || rest[0] || null; if (S.sel) { const n = el.querySelector('[data-i="' + S.sel.index + '"]'); if (n) n.classList.add('sel'); } }
   }
   const fmtQ = (v, q) => (S.phys && q ? (v * MSA.Q[q].f + MSA.Q[q].off).toFixed(MSA.Q[q].dec) : String(v));
@@ -189,7 +210,7 @@
     const hasUnits = m.q1 || m.q2 || m.dq;
     $('mhead').innerHTML = '<div><h2>' + esc(m.name) + '</h2><div class="sub">data 0x' + hex(m.dataAddr, 5) + '-0x' + hex(m.end - 1, 5) + ' · ' + MSA.dims(m) + ' (columns x rows) · axis header 0x' + hex(m.addr, 5) + ' · 16-bit ' + (m.signed ? 'signed' : 'unsigned') + ' · raw ' + m.min + '…' + m.max + '</div></div><span class="grow"></span>' +
       (canCmp ? '<span class="seg" id="segMode">' + [['val', 'This file'], ['diff', 'Difference'], ['ref', 'Reference']].map(([k, t]) => '<button data-m="' + k + '" class="' + (mode === k ? 'on' : '') + '">' + t + '</button>').join('') + '</span>' : '') +
-      '<span class="seg" id="segUnit"><button data-p="0" class="' + (S.phys ? '' : 'on') + '">Raw</button><button data-p="1" class="' + (S.phys ? 'on' : '') + '"' + (hasUnits ? '' : ' disabled title="No unit known for this map"') + '>Units</button></span>' +
+      '<button data-rename="1" title="Give this map a custom name">Rename</button><span class="seg" id="segUnit"><button data-p="0" class="' + (S.phys ? '' : 'on') + '">Raw</button><button data-p="1" class="' + (S.phys ? 'on' : '') + '"' + (hasUnits ? '' : ' disabled title="No unit known for this map"') + '>Units</button></span>' +
       (editable ? '<span id="segEdit"><input id="opv" type="text" inputmode="numeric" autocomplete="off" placeholder="value" value="' + esc(S.opv) + '"><button data-op="set" title="Set the selected cells to this value">Set</button><button data-op="add" title="Add this value to the selected cells">+</button><button data-op="sub" title="Subtract this value from the selected cells">−</button></span><span id="selcount"></span>' : '');
     const rowsLbl = axisLabel(m.q1, m.id1), colsLbl = m.id2 !== null ? axisLabel(m.q2, m.id2) : null;
     $('mnote').className = 'note';
@@ -349,11 +370,12 @@
     h += '<h4>Data blocks &amp; checksums</h4><table class="plain"><tr><th>Block</th><th>Range</th><th>Maps</th><th>Coding</th><th>Stored checksum</th><th>Computed</th><th>Status</th></tr>' +
       info.blocks.map((b, i) => { const s = ck.blocks[i]; return '<tr><td>' + esc(b.label) + '</td><td class="m">0x' + hex(b.start, 5) + '-0x' + hex(b.end - 1, 5) + '</td><td class="m">' + b.maps.length + '</td><td class="m">' + (b.coding !== null ? b.coding : '-') + '</td><td class="m">' + s.stored + '</td><td class="m">' + (ck.supported ? s.computed : '-') + '</td><td class="m" style="color:' + (!ck.supported ? 'var(--dim)' : s.ok ? 'var(--up)' : 'var(--acc)') + '">' + (!ck.supported ? '-' : s.ok ? '✓ OK' : '✗ needs fix') + '</td></tr>'; }).join('') + '</table>';
     if (ck.supported) h += '<p class="note"' + (ck.bad ? ' style="color:#ffd58a"' : '') + '>' + (ck.bad ? '<b>' + ck.bad + ' block checksum' + (ck.bad > 1 ? 's' : '') + ' need correcting.</b> Click <b>Correct checksums</b> at the top, or just save - the file is checksum-corrected automatically on save.' : 'All block checksums are valid. Editing a map marks the affected block for correction; saving rewrites the checksums automatically.') + '</p>';
-    else h += '<p class="note warn" style="margin-top:14px">This file is not one of the recognised MSA15.5.5 families (028906021G*, 038906018*), so the checksum algorithm is not applied and automatic correction is disabled - the stored value is shown exactly as read, and nothing is altered.</p>';
+    else h += '<p class="note warn" style="margin-top:14px">This file is not a recognised MSA15.5 dump, so automatic checksum correction is disabled - the stored value is shown exactly as read, and nothing is altered.</p>';
     $('p-chips').innerHTML = h;
   }
   // ---------- checksums ----------
   const familySupported = () => !!(S.cur && S.cur.info && S.cur.info.family);
+  const checksumSupported = () => !!(S.cur && MSA.checksumStatus(S.cur.bin, S.cur.info).supported);
   function refreshCaches() {   // after bytes change: block.stored + byte sums (maps are unaffected by checksum bytes)
     for (const blk of S.cur.info.blocks) blk.stored = hex(MSA.w16(S.cur.bin, blk.end - 2), 4) + hex(MSA.w16(S.cur.bin, blk.end - 4), 4);
     const chips = S.cur.bin.length % 2 === 0 ? MSA.split(S.cur.bin) : null;
@@ -387,16 +409,52 @@
   // ---------- one-click tuning ----------
   function renderTune() {
     const bar = $('tunebar');
-    if (!S.cur || !familySupported()) { bar.style.display = 'none'; return; }
+    if (!S.cur || !S.cur.info.blocks.length) { bar.style.display = 'none'; return; }
     bar.style.display = 'flex';
-    const iq = MSA.readConstValue(S.cur.bin, S.cur.info, 'iqmax');
+    const hasIQ = MSA.hasConst(S.cur.info, 'iqmax');
+    const iq = hasIQ ? MSA.readConstValue(S.cur.bin, S.cur.info, 'iqmax') : null;
     if (document.activeElement !== $('tIQ')) $('tIQ').value = iq != null ? iq : '';
+    $('tIQ').disabled = $('tIQset').disabled = !hasIQ;
+    $('tIQ').title = hasIQ ? 'Maximum injection quantity limit' : 'No verified IQ-limit constant profile for this software';
     const rpm = MSA.revLimitValue(S.cur.info), hasRev = rpm != null;
     if (document.activeElement !== $('tRPM')) $('tRPM').value = hasRev ? rpm : '';
     $('tRPM').disabled = $('tRPMset').disabled = !hasRev;
     $('tRPMset').title = hasRev ? 'Raise the engine-speed axis top on every RPM map (torque limiter, driver\'s wish, smoke limiter, ...): last = value, the one before = value-20' : 'No engine-speed axis map found';
     $('tEGR').disabled = !S.cur.info.blocks.some(b => b.maps.some(m => /^EGR\b/.test(m.name || '')));
     $('t3bar').disabled = !MSA.hasConst(S.cur.info, 'mapfac');
+    const original = S.userOriginal;
+    $('tAuto').style.display = original ? '' : 'none';
+    $('tAuto').disabled = !!S.autoStage1Done;
+    const eligible = [...new Set(S.cur.info.blocks.flatMap(b => b.maps).filter(m => !m.flat && /^(Boost target map|Boost limit|Torque limiter|Drivers wish|Smoke limiter\b|Start of injection|N146 Pump voltage map|N75 duty)/.test(m.name || '')).map(m => m.name.replace(/ \(\d+\)$/, '').replace(/ \?$/, '')))];
+    $('tAuto').title = S.autoStage1Done ? 'Changed maps: ' + (S.autoStage1Summary || 'none') : 'Changeable maps: ' + (eligible.length ? eligible.join(', ') : 'none detected');
+  }
+  function autoStage1() {
+    if (!S.cur || S.autoStage1Done || !S.userOriginal) return;
+    S.autoStage1Done = true;
+    const deltas = [
+      [/^Boost target map/, 180], [/^Boost limit/, 180], [/^Torque limiter/, 1400],
+      [/^Drivers wish/, 330], [/^Smoke limiter\b/, 290], [/^Start of injection/, 80],
+      [/^N146 Pump voltage map/, 150], [/^N75 duty/, 195]
+    ];
+    let changed = 0, maps = 0; const changedNames = new Set();
+    for (const blk of S.cur.info.blocks) for (const m of blk.maps) {
+      const hit = deltas.find(([re]) => re.test(m.name || '')); if (!hit || m.flat) continue;
+      const delta = hit[1]; let mapChanged = false;
+      for (let k = 0; k < m.n1 * m.n2; k++) {
+        const raw = MSA.rawData(S.cur.bin, m)[k];
+        const current = m.signed ? MSA.s16(raw) : raw;
+        // Pair-derived Stage 1 changes scale with existing fueling/command
+        // values. Preserve zero cells and signed negative correction cells;
+        // this is essential for low-pedal Drivers Wish cutout areas.
+        if (current === 0 || (m.signed && current < 0)) continue;
+        const scaled = Math.max(1, Math.round(delta * current / Math.max(1, m.max)));
+        const lo = m.signed ? -32768 : 0, next = Math.max(lo, Math.min(m.signed ? 32767 : 65535, current + scaled));
+        if (next !== current) { MSA.setValue(S.cur.bin, m, Math.floor(k / m.n2), k % m.n2, next & 0xFFFF); changed++; mapChanged = true; }
+      }
+      if (mapChanged) { maps++; changedNames.add(m.name.replace(/ \(\d+\)$/, '').replace(/ \?$/, '')); }
+    }
+    S.autoStage1Summary = [...changedNames].join(', ');
+    afterTune('Auto Stage 1 changed: ' + (S.autoStage1Summary || 'no recognized maps'), changed);
   }
   function afterTune(label, count) {
     if (!count) { toast(label + ': nothing changed (already set, or target not found).'); return; }
@@ -450,7 +508,14 @@
     afterEdit(maps);
   }
   function inlineEdit(cell, startVal, write) {
+    // Freeze the cell's measured width before replacing its text. Without
+    // this, the input's intrinsic width can make the whole map table expand
+    // dramatically while editing a value.
+    const width = cell.getBoundingClientRect().width;
+    cell.classList.add('editing');
+    cell.style.width = width + 'px'; cell.style.minWidth = width + 'px'; cell.style.maxWidth = width + 'px';
     const inp = document.createElement('input'); inp.value = startVal; inp.autocomplete = 'off';
+    inp.style.width = '76px'; inp.style.minWidth = '76px'; inp.style.maxWidth = '76px';
     cell.textContent = ''; cell.appendChild(inp); inp.focus(); inp.select();
     let done = false;
     const commit = keep => { if (done) return; done = true; if (keep) write(inp.value); else renderMap(); };
@@ -464,6 +529,14 @@
   function editAxis(th) {
     const m0 = S.sel, axis = th.dataset.axis, k = +th.dataset.k, qkey = axis === 'col' ? m0.q2 : m0.q1, cur = axis === 'col' ? m0.ax2[k] : m0.ax1[k];
     inlineEdit(th, fmtQ(cur, qkey), v => { const rw = typedToRaw(qkey, v); if (rw == null) return renderMap(); MSA.setAxisValue(S.cur.bin, m0, axis, k, rw); renderCk(); renderMap(); });
+  }
+  function renameSelected() {
+    if (!S.sel) return;
+    const name = window.prompt('Map name:', S.sel.name);
+    if (name === null) return;
+    const clean = name.trim(); if (!clean) return toast('Enter a map name.');
+    S.sel.name = clean; S.sel.identified = true; S.sel.sure = true; S.sel.source = 'user';
+    renderList(); renderMap();
   }
   function correspondingMap(prev, bi) { const maps = S.cur.info.blocks[bi].maps; if (!maps.length) return null; if (prev) { const byName = maps.find(x => x.name === prev.name); if (byName) return byName; if (maps[prev.index]) return maps[prev.index]; } return maps[0]; }
 
@@ -482,6 +555,7 @@
   $('tRPMset').onclick = () => { const v = parseInt($('tRPM').value, 10); if (isNaN(v) || v <= 0) return toast('Enter a hard-cut RPM.'); afterTune('Hard-cut ' + v + ' rpm', MSA.setRevLimit(S.cur.bin, S.cur.info, v, scopeBlocks())); };
   $('tEGR').onclick = () => afterTune('EGR off (850 mg)', MSA.egrOff(S.cur.bin, S.cur.info, 850, scopeBlocks()));
   $('t3bar').onclick = () => afterTune('3-bar mod', MSA.set3bar(S.cur.bin, S.cur.info, scopeBlocks()));
+  $('tAuto').onclick = autoStage1;
     // ---------- scope (All code blocks checkbox) ----------
   const allBlocks = () => { const cb = $('allCB'); return !!cb && cb.checked; };
   function scopeBlocks() { return allBlocks() ? S.cur.info.blocks : [S.cur.info.blocks[S.block]].filter(Boolean); }
@@ -513,9 +587,13 @@
   $('mhead').addEventListener('keydown', e => { if (e.target.id === 'opv' && e.key === 'Enter') { e.preventDefault(); applyOp('set'); } });
   $('blocks').onclick = e => { const b = e.target.closest('button'); if (b) { const prev = S.sel; S.block = +b.dataset.b; S.sel = correspondingMap(prev, S.block); render(); } };
   $('views').onclick = e => { const b = e.target.closest('button'); if (b) setView(b.dataset.v); };
-  $('list').onclick = e => { const it = e.target.closest('.it'); if (it) select(S.block, +it.dataset.i); };
+  $('list').onclick = e => {
+    const fold = e.target.closest('[data-fold]');
+    if (fold) { S.foldOther[S.block] = !S.foldOther[S.block]; renderList(); return; }
+    const it = e.target.closest('.it'); if (it) select(S.block, +it.dataset.i);
+  };
   $('q').oninput = renderList; $('onlyChg').onchange = renderList;
-  $('mhead').onclick = e => { const b = e.target.closest('button'); if (!b || b.disabled) return; if (b.dataset.op) { applyOp(b.dataset.op); return; } if (b.dataset.m) S.mode = b.dataset.m; if (b.dataset.p) S.phys = b.dataset.p === '1'; renderMap(); };
+  $('mhead').onclick = e => { const b = e.target.closest('button'); if (!b || b.disabled) return; if (b.dataset.rename) { renameSelected(); return; } if (b.dataset.op) { applyOp(b.dataset.op); return; } if (b.dataset.m) S.mode = b.dataset.m; if (b.dataset.p) S.phys = b.dataset.p === '1'; renderMap(); };
   $('p-changes').onclick = e => { const r = e.target.closest('tr.click'); if (r) select(+r.dataset.b, +r.dataset.i); };
   window.addEventListener('resize', drawChart);
   $('segViz').onclick = e => { const b = e.target.closest('button'); if (b && !b.disabled) { S.viz = b.dataset.z; S.hoverRow = null; S.hover3d = null; clearHl(); drawChart(); } };
