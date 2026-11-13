@@ -6,7 +6,7 @@
   const hex = MSA.hex;
   const FORCE_DOWNLOAD = /[?&]dl=1/.test(location.search);
 
-  const S = { cur: null, ref: null, pending: null, block: 0, sel: null, mode: 'val', phys: true, cmp: null, view: 'map', viz: '2d', opv: '', cells: new Set(), anchor: null, _lastSel: null, foldOther: {}, rot: { az: -0.7, el: 0.9 }, hoverRow: null, hover3d: null };
+  const S = { cur: null, ref: null, pending: null, block: 0, sel: null, mode: 'val', phys: true, cmp: null, view: 'map', viz: '2d', opv: '', cells: new Set(), anchor: null, _lastSel: null, foldOther: {}, userOriginal: false, autoStage1Done: false, autoStage1Summary: '', autoStage1Pending: false, rot: { az: -0.7, el: 0.9 }, hoverRow: null, hover3d: null };
 
   // ---------- helpers ----------
   function banner(msg, kind) {
@@ -68,7 +68,8 @@
         if (m) info.ident = { addr: 0, text: m[2].toUpperCase(), part: m[2].toUpperCase(), bosch: m[1], gear: '', sw: '', engine: '' };
         if (info.ident && /^028906021/.test(info.ident.part)) info.ecuType = img.bin.length === 0x10000 ? 'EDC MSA12 / EDC1.3.3' : 'MSA15.5';
       }
-      S.cur = { name: img.name, bin: img.bin, orig: img.bin.slice(), info };
+      S.userOriginal = window.confirm('Is this an Original file?\n\nChoose Yes only for an untouched factory/original BIN. This enables Auto Stage 1.');
+      S.cur = { name: img.name, bin: img.bin, orig: img.bin.slice(), info }; S.autoStage1Done = false; S.autoStage1Summary = '';
       S.ref = null; S.cmp = null; S.block = 0; S.sel = null; S.mode = 'val'; S.cells = new Set(); S.anchor = null; S._lastSel = null;
       const w = S.cur.info.warnings;
       if (w.length) banner((img.msg ? img.msg + '<br>' : '') + w.map(esc).join('<br>'), 'err'); else banner(img.msg, img.kind);
@@ -421,6 +422,39 @@
     $('tRPMset').title = hasRev ? 'Raise the engine-speed axis top on every RPM map (torque limiter, driver\'s wish, smoke limiter, ...): last = value, the one before = value-20' : 'No engine-speed axis map found';
     $('tEGR').disabled = !S.cur.info.blocks.some(b => b.maps.some(m => /^EGR\b/.test(m.name || '')));
     $('t3bar').disabled = !MSA.hasConst(S.cur.info, 'mapfac');
+    const original = S.userOriginal;
+    $('tAuto').style.display = original ? '' : 'none';
+    $('tAuto').disabled = !!S.autoStage1Done;
+    const eligible = [...new Set(S.cur.info.blocks.flatMap(b => b.maps).filter(m => !m.flat && /^(Boost target map|Boost limit|Torque limiter|Drivers wish|Smoke limiter\b|Start of injection|N146 Pump voltage map|N75 duty)/.test(m.name || '')).map(m => m.name.replace(/ \(\d+\)$/, '').replace(/ \?$/, '')))];
+    $('tAuto').title = S.autoStage1Done ? 'Changed maps: ' + (S.autoStage1Summary || 'none') : 'Changeable maps: ' + (eligible.length ? eligible.join(', ') : 'none detected');
+  }
+  function autoStage1() {
+    if (!S.cur || S.autoStage1Done || !S.userOriginal) return;
+    S.autoStage1Done = true;
+    const deltas = [
+      [/^Boost target map/, 180], [/^Boost limit/, 180], [/^Torque limiter/, 1400],
+      [/^Drivers wish/, 330], [/^Smoke limiter\b/, 290], [/^Start of injection/, 80],
+      [/^N146 Pump voltage map/, 150], [/^N75 duty/, 195]
+    ];
+    let changed = 0, maps = 0; const changedNames = new Set();
+    for (const blk of S.cur.info.blocks) for (const m of blk.maps) {
+      const hit = deltas.find(([re]) => re.test(m.name || '')); if (!hit || m.flat) continue;
+      const delta = hit[1]; let mapChanged = false;
+      for (let k = 0; k < m.n1 * m.n2; k++) {
+        const raw = MSA.rawData(S.cur.bin, m)[k];
+        const current = m.signed ? MSA.s16(raw) : raw;
+        // Pair-derived Stage 1 changes scale with existing fueling/command
+        // values. Preserve zero cells and signed negative correction cells;
+        // this is essential for low-pedal Drivers Wish cutout areas.
+        if (current === 0 || (m.signed && current < 0)) continue;
+        const scaled = Math.max(1, Math.round(delta * current / Math.max(1, m.max)));
+        const lo = m.signed ? -32768 : 0, next = Math.max(lo, Math.min(m.signed ? 32767 : 65535, current + scaled));
+        if (next !== current) { MSA.setValue(S.cur.bin, m, Math.floor(k / m.n2), k % m.n2, next & 0xFFFF); changed++; mapChanged = true; }
+      }
+      if (mapChanged) { maps++; changedNames.add(m.name.replace(/ \(\d+\)$/, '').replace(/ \?$/, '')); }
+    }
+    S.autoStage1Summary = [...changedNames].join(', ');
+    afterTune('Auto Stage 1 changed: ' + (S.autoStage1Summary || 'no recognized maps'), changed);
   }
   function afterTune(label, count) {
     if (!count) { toast(label + ': nothing changed (already set, or target not found).'); return; }
@@ -521,6 +555,7 @@
   $('tRPMset').onclick = () => { const v = parseInt($('tRPM').value, 10); if (isNaN(v) || v <= 0) return toast('Enter a hard-cut RPM.'); afterTune('Hard-cut ' + v + ' rpm', MSA.setRevLimit(S.cur.bin, S.cur.info, v, scopeBlocks())); };
   $('tEGR').onclick = () => afterTune('EGR off (850 mg)', MSA.egrOff(S.cur.bin, S.cur.info, 850, scopeBlocks()));
   $('t3bar').onclick = () => afterTune('3-bar mod', MSA.set3bar(S.cur.bin, S.cur.info, scopeBlocks()));
+  $('tAuto').onclick = autoStage1;
     // ---------- scope (All code blocks checkbox) ----------
   const allBlocks = () => { const cb = $('allCB'); return !!cb && cb.checked; };
   function scopeBlocks() { return allBlocks() ? S.cur.info.blocks : [S.cur.info.blocks[S.block]].filter(Boolean); }

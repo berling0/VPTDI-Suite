@@ -334,6 +334,11 @@
         m.d.slice(m.n2, Math.min(m.d.length, 5 * m.n2)).some(v => v >= 6500);
       if (torque16) {
         name = 'Torque limiter'; m.dq = 'iq'; m.sure = true;
+      } else if (is3d && m.q1 === 'rpm' && m.n1 === 16 && m.n2 === 8 && a2[0] <= 100 && a2[a2.length - 1] >= 8000 && min >= 0 && max >= 4500 && max <= 7000) {
+        // Some EDC15V manuals store Drivers Wish as 16x8 with a private
+        // second-axis ID (for example C1D8), instead of the recognised pedal
+        // axis ID used by the automatic software block.
+        name = 'Drivers wish'; m.q2 = 'pedal'; m.dq = 'iq'; m.sure = true;
       } else if (is3d && m.q1 === 'rpm' && m.n1 >= 12 && m.n2 >= 6 && m.n2 <= 10 && a2[a2.length - 1] === 10000 && a2[0] >= 0 && max >= 3000 && max <= 6500) {
         name = 'Drivers wish'; m.q2 = 'pedal'; m.dq = 'iq'; m.sure = true;
       } else if (is3d && m.n1 <= 4 && within(a1, 400, 1200) && m.q2 === 'rpm' && m.n2 >= 12 && max >= 2000 && max <= 6000) {
