@@ -573,6 +573,43 @@
     return null;
   }
   const sum = (b, mask) => { let s = 0; for (let i = 0; i < b.length; i++) s = (s + b[i]) >>> 0; return mask ? s & mask : s; };
+  const sum8 = (b, a, e) => { let s = 0; for (let i = a; i < e; i++) s = (s + b[i]) & 0xFF; return s; };
+
+  // Decide which checksum family a freshly-loaded image uses, and describe its
+  // blocks. Called at analyze() time, so `bin` is the untouched baseline:
+  //   dual16  - 256 KiB MSA15.5 / EDC15 (family 1): 4-byte checksum per 0x8000
+  //             data block (see blockChecksum). Validated for 028906021*/038906018*.
+  //   sum8    - older VP 1.9 TDI: a single 8-bit checksum byte at the END of each
+  //             0x8000 block makes that block's byte sum come out to a fixed target.
+  //             32 KiB (Bosch 8A0907401, e.g. 0281001133/0281191111): one block,
+  //             whole block sums to 0x00.  64 KiB (Bosch 028906021*, e.g.
+  //             0281001248/0281001259/...): two banks, the whole image sums to 0x00
+  //             and each bank keeps its own factory byte sum. Verified byte-exact:
+  //             the corrector reproduces every factory Stage checksum byte across
+  //             all supplied 64 KiB dumps and the 32 KiB 8A0907401 dumps.
+  // Unsupported here: 32 KiB EDC15 images carrying the 3C3C checksum marker
+  // (0281001410) and petrol Motronic (0261*) dumps - left untouched, never guessed.
+  function buildCk(bin, mapBlocks) {
+    const n = bin.length;
+    if (n === 0x40000) {
+      const blocks = mapBlocks.map(b => ({ label: b.label, start: b.start, end: b.end, store: b.end - 4, width: 4 }));
+      return { family: blocks.length ? 'dual16' : null, blocks, note: blocks.length ? '' : 'No 0x8000 data block was found in this 256 KiB file.' };
+    }
+    if (n === 0x8000) {
+      if (bin[0x7FF8] === 0x3C && bin[0x7FF9] === 0x3C)
+        return { family: null, blocks: [], note: '32 KiB EDC15 image with a 3C3C checksum marker - this checksum variant is not supported yet, so the file is left unchanged.' };
+      if (sum8(bin, 0, 0x8000) !== 0)
+        return { family: null, blocks: [], note: 'This 32 KiB image is not the MSA15 8-bit sum family (its block byte sum is not zero), so its checksum is left unchanged.' };
+      return { family: 'sum8', blocks: [{ label: 'Calibration', start: 0, end: 0x8000, store: 0x7FFF, width: 1, target: 0 }], note: '' };
+    }
+    if (n === 0x10000) {
+      if (sum8(bin, 0, 0x10000) !== 0)
+        return { family: null, blocks: [], note: 'This 64 KiB image is not the MSA15 8-bit sum family (its byte sum is not zero), so its checksum is left unchanged.' };
+      const mk = (base, label) => ({ label, start: base, end: base + 0x8000, store: base + 0x7FFF, width: 1, target: sum8(bin, base, base + 0x8000) });
+      return { family: 'sum8', blocks: [mk(0, 'Bank 0 (0x0000-0x7FFF)'), mk(0x8000, 'Bank 1 (0x8000-0xFFFF)')], note: '' };
+    }
+    return { family: null, blocks: [], note: 'Unsupported image size for checksum correction.' };
+  }
 
   function analyzeCore(bin) {
     const blocks = [];
@@ -614,6 +651,7 @@
     if (chips && chipMarker(chips.L) === 'H' && chipMarker(chips.H) === 'L') warnings.push('The chip tags are swapped: this file looks like it was merged with HHH and LLL the wrong way round.');
     return {
       size: bin.length, blocks, ident, ecuType: ecuTypeOf({ size: bin.length, ident }), warnings, family: fam ? fam.name : null,
+      ck: buildCk(bin, blocks),
       sums: { file: hex(sum(bin, 0xFFFF), 4), L: chips ? hex(sum(chips.L, 0xFFFF), 4) : '', H: chips ? hex(sum(chips.H, 0xFFFF), 4) : '' },
       mapCount: blocks.reduce((t, b) => t + b.maps.length, 0)
     };
@@ -638,6 +676,7 @@
     if (be) {
       for (const blk of info.blocks) for (const m of blk.maps) m.be = true;
       info.endian = 'big';
+      if (info.ck) info.ck.family = null; // the dual-16 algorithm is defined on little-endian storage
       info.warnings.push('This dump uses big-endian MSA15.5 word storage; map values are decoded and written back with that byte order.');
     } else info.endian = 'little';
     return info;
@@ -735,30 +774,42 @@
   const ckHex = bytes => hex(bytes[3], 2) + hex(bytes[2], 2) + hex(bytes[0], 2) + hex(bytes[1], 2); // same layout as block.stored
   // Per-block status: stored vs. recomputed checksum. `info` comes from analyze().
   // A block's stored checksum matches what family-1 computes over `src`.
-  function blockOk(src, blk) { const o = blk.end - 4, w = checksumBytes(src, blk.start); return src[o] === w[0] && src[o + 1] === w[1] && src[o + 2] === w[2] && src[o + 3] === w[3]; }
-  function checksumStatus(bin, info, orig) {
-    const blocks = info.blocks.map(blk => {
-      const store = blk.end - 4, want = checksumBytes(bin, blk.start);
-      const have = [bin[store], bin[store + 1], bin[store + 2], bin[store + 3]];
-      return { label: blk.label, start: blk.start, store, ok: blockOk(bin, blk), stored: ckHex(have), computed: ckHex(want) };
-    });
-    // Support is determined from the immutable dump layout, not from whether
-    // the current bytes still have a valid checksum. Editing a map naturally
-    // makes the current checksum invalid; that must produce "needs fix", not
-    // make the file become an unknown ECU. The 256 KiB size plus detected
-    // 0x8000 data blocks also rejects the supplied older ROM formats.
-    const supported = info.size === 0x40000 && blocks.length > 0 && info.endian !== 'big';
-    return { supported, blocks, bad: blocks.filter(b => !b.ok).length, total: blocks.length };
+  // The correct checksum bytes for one checksum block, in the two supported
+  // families. dual16 -> 4 bytes from blockChecksum; sum8 -> the one byte that
+  // makes the block's 8-bit byte sum equal the block's recorded target.
+  function ckComputeBytes(bin, blk) {
+    if (blk.width === 4) return checksumBytes(bin, blk.start);
+    let s = 0; for (let i = blk.start; i < blk.store; i++) s = (s + bin[i]) & 0xFF;
+    return [((blk.target || 0) - s) & 0xFF];
   }
-  // Returns a new image with every block checksum recomputed and written. Only touches the 4 bytes per block.
+  const ckStored = (bin, blk) => { const o = []; for (let i = 0; i < blk.width; i++) o.push(bin[blk.store + i]); return o; };
+  const ckShow = (blk, bytes) => blk.width === 4 ? ckHex(bytes) : hex(bytes[0], 2);
+  // Per-block status: stored vs. recomputed checksum, using info.ck (frozen at
+  // analyze() time, so the baseline is the originally-loaded image). Support is a
+  // property of that layout, not of whether the current bytes still validate:
+  // editing a map must read as "needs fix", never turn the file into an unknown ECU.
+  function checksumStatus(bin, info) {
+    const model = (info && info.ck) || { family: null, blocks: [], note: '' };
+    const blocks = model.blocks.map(blk => {
+      const have = ckStored(bin, blk), want = ckComputeBytes(bin, blk);
+      return {
+        label: blk.label, start: blk.start, end: blk.end, store: blk.store, width: blk.width,
+        ok: have.every((v, i) => v === want[i]), stored: ckShow(blk, have), computed: ckShow(blk, want)
+      };
+    });
+    return { family: model.family, supported: !!model.family, note: model.note || '', blocks, bad: blocks.filter(b => !b.ok).length, total: blocks.length };
+  }
+  // Returns a new image with every block checksum recomputed and written. Only touches the checksum bytes.
   function correctChecksums(bin, info) {
-    const out = bin.slice(), st = { fixed: 0 };
-    for (const blk of info.blocks) {
-      const store = blk.end - 4, b = checksumBytes(out, blk.start);
-      if (out[store] !== b[0] || out[store + 1] !== b[1] || out[store + 2] !== b[2] || out[store + 3] !== b[3]) st.fixed++;
-      out[store] = b[0]; out[store + 1] = b[1]; out[store + 2] = b[2]; out[store + 3] = b[3];
+    const out = bin.slice(); let fixed = 0;
+    const model = (info && info.ck) || { blocks: [] };
+    for (const blk of model.blocks) {
+      const want = ckComputeBytes(out, blk);
+      let changed = false;
+      for (let i = 0; i < blk.width; i++) if (out[blk.store + i] !== want[i]) { out[blk.store + i] = want[i]; changed = true; }
+      if (changed) fixed++;
     }
-    return { out, fixed: st.fixed };
+    return { out, fixed };
   }
   // Write one raw 16-bit value into a map cell (row r, column c). Mutates `bin`.
   function setValue(bin, m, r, c, raw) {

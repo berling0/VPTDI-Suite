@@ -367,10 +367,14 @@
       [[base + '.LLL', 'even (0, 2, 4…)', L, tag(L)], [base + '.HHH', 'odd (1, 3, 5…)', H, tag(H)], [baseName(S.cur.name) + '.bin', 'all', S.cur.bin, '-']].map(([n, w, d, t]) =>
         '<tr><td class="m">' + esc(n) + '</td><td>' + w + '</td><td class="m">' + kb(d.length) + '</td><td class="m">' + t + '</td><td class="m">' + hex(MSA.sum(d, 0xFFFF)) + '</td><td class="m">' + hex(MSA.sum(d), 8) + '</td></tr>').join('') + '</table>';
     const ck = MSA.checksumStatus(S.cur.bin, info);
-    h += '<h4>Data blocks &amp; checksums</h4><table class="plain"><tr><th>Block</th><th>Range</th><th>Maps</th><th>Coding</th><th>Stored checksum</th><th>Computed</th><th>Status</th></tr>' +
-      info.blocks.map((b, i) => { const s = ck.blocks[i]; return '<tr><td>' + esc(b.label) + '</td><td class="m">0x' + hex(b.start, 5) + '-0x' + hex(b.end - 1, 5) + '</td><td class="m">' + b.maps.length + '</td><td class="m">' + (b.coding !== null ? b.coding : '-') + '</td><td class="m">' + s.stored + '</td><td class="m">' + (ck.supported ? s.computed : '-') + '</td><td class="m" style="color:' + (!ck.supported ? 'var(--dim)' : s.ok ? 'var(--up)' : 'var(--acc)') + '">' + (!ck.supported ? '-' : s.ok ? '✓ OK' : '✗ needs fix') + '</td></tr>'; }).join('') + '</table>';
+    const famLabel = ck.family === 'sum8' ? '8-bit sum' : ck.family === 'dual16' ? 'family 1 (dual 16-bit)' : null;
+    h += '<h4>Data blocks &amp; checksums' + (famLabel ? ' <span class="note" style="font-weight:400">· ' + famLabel + '</span>' : '') + '</h4><table class="plain"><tr><th>Block</th><th>Range</th><th>Maps</th><th>Stored checksum</th><th>Computed</th><th>Status</th></tr>' +
+      (ck.blocks.length ? ck.blocks.map(s => {
+        const maps = info.blocks.filter(b => b.start >= s.start && b.end <= s.end).reduce((t, b) => t + b.maps.length, 0);
+        return '<tr><td>' + esc(s.label) + '</td><td class="m">0x' + hex(s.start, 4) + '-0x' + hex(s.store + s.width - 1, 4) + '</td><td class="m">' + maps + '</td><td class="m">' + s.stored + '</td><td class="m">' + (ck.supported ? s.computed : '-') + '</td><td class="m" style="color:' + (!ck.supported ? 'var(--dim)' : s.ok ? 'var(--up)' : 'var(--acc)') + '">' + (!ck.supported ? '-' : s.ok ? '✓ OK' : '✗ needs fix') + '</td></tr>';
+      }).join('') : '<tr><td colspan="6" class="m" style="color:var(--dim)">' + esc(ck.note || 'No checksum blocks found.') + '</td></tr>') + '</table>';
     if (ck.supported) h += '<p class="note"' + (ck.bad ? ' style="color:#ffd58a"' : '') + '>' + (ck.bad ? '<b>' + ck.bad + ' block checksum' + (ck.bad > 1 ? 's' : '') + ' need correcting.</b> Click <b>Correct checksums</b> at the top, or just save - the file is checksum-corrected automatically on save.' : 'All block checksums are valid. Editing a map marks the affected block for correction; saving rewrites the checksums automatically.') + '</p>';
-    else h += '<p class="note warn" style="margin-top:14px">This file is not a recognised MSA15.5 dump, so automatic checksum correction is disabled - the stored value is shown exactly as read, and nothing is altered.</p>';
+    else h += '<p class="note warn" style="margin-top:14px">' + esc(ck.note || 'This file is not a recognised MSA checksum family, so automatic checksum correction is disabled - the stored value is shown exactly as read, and nothing is altered.') + '</p>';
     $('p-chips').innerHTML = h;
   }
   // ---------- checksums ----------
@@ -395,7 +399,7 @@
     $('bFix').disabled = !st.supported || st.bad === 0;
     if (!st.supported) {
       bar.className = 'na';
-      bar.innerHTML = '<span class="dot"></span><span>Checksum: <b>not a recognised MSA15.5.5 family</b> — automatic correction is disabled so an unknown file is never altered.</span>';
+      bar.innerHTML = '<span class="dot"></span><span>Checksum: <b>not a recognised MSA checksum family</b> — automatic correction is disabled so an unknown file is never altered.' + (st.note ? ' <span class="note">' + esc(st.note) + '</span>' : '') + '</span>';
     } else if (st.bad === 0) {
       bar.className = 'ok';
       bar.innerHTML = '<span class="dot"></span><span><b>Block checksums valid</b> — all ' + st.total + ' match.</span>';
