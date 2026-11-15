@@ -1,1 +1,2 @@
-Editor for VP TDI VAG cars, supported ecus: MSA12, MSA15.5, EDC15V
+Editor for VP TDI VAG cars, supported ecus: MSA12, MSA15.5, EDC15V.
+Web version accessible at: https://berling0.github.io/VPTDI-Suite/
