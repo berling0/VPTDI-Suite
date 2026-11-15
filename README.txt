@@ -1,1 +1,1 @@
-Editor for VP TDI VAG cars, supported ecus: MSA15.5, EDC15V
+Editor for VP TDI VAG cars, supported ecus: MSA12, MSA15.5, EDC15V
