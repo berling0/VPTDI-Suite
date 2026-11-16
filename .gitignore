@@ -4,3 +4,5 @@
 *.Stage1
 *.Stage2
 node_modules/
+# Local reference dumps used to calibrate the tuning presets - never pushed
+MSA15DUMP/

@@ -38,11 +38,13 @@
     const chip = MSA.looksLikeSingleChip(f.buf);
     if (S.pending && !forCompare && chip && chip !== 'MSA15.1' && S.pending.buf.length === f.buf.length) { const p = S.pending; S.pending = null; return mergeTwo(p, f); }
     if (chip) {
-      if (chip === 'MSA15.1') return { name: f.name, bin: f.buf, msg: '<b>' + esc(f.name) + '</b> is a 64 KiB EDC MSA12 / EDC1.3.3 image. The detected 8-bit maps are editable; checksum correction is not available for this older format.', kind: '' };
+      // 64 KiB EDC MSA12 / EDC1.3.3 is a complete single-image ECU: open it as-is.
+      // Its maps are editable and its 8-bit checksums are corrected on save; the
+      // Chips & checksums panel shows the exact per-bank status.
+      if (chip === 'MSA15.1') return { name: f.name, bin: f.buf, msg: '<b>' + esc(f.name) + '</b> is a 64 KiB EDC MSA12 / EDC1.3.3 image. The detected maps are editable; its 8-bit checksums are corrected automatically on save (see the Chips &amp; checksums panel).', kind: '' };
       if (forCompare) throw new Error(esc(f.name) + ' is a single chip dump. To compare, select both chip files (LLL and HHH) together, or a combined bin.');
       S.pending = f;
-      if (chip === 'MSA15.1') banner('<b>' + esc(f.name) + '</b> is a 64 KiB MSA15.1/older ROM image. This editor supports 128 KiB MSA15.5 chip files or a combined 256 KiB dump.', 'err');
-      else banner('<b>' + esc(f.name) + '</b> is a single chip dump (' + kb(f.buf.length) + (chip === '?' ? '' : ', tagged <b>' + chip + '</b>') + '). Now open the other chip file and the two are merged automatically.', '');
+      banner('<b>' + esc(f.name) + '</b> is a single chip dump (' + kb(f.buf.length) + (chip === '?' ? '' : ', tagged <b>' + chip + '</b>') + '). Now open the other chip file and the two are merged automatically.', '');
       return null;
     }
     return { name: f.name, bin: f.buf, msg: null };
@@ -432,18 +434,20 @@
     const eligible = [...new Set(S.cur.info.blocks.flatMap(b => b.maps).filter(m => !m.flat && /^(Boost target map|Boost limit|Torque limiter|Drivers wish|Smoke limiter\b|Start of injection|N146 Pump voltage map|N75 duty)/.test(m.name || '')).map(m => m.name.replace(/ \(\d+\)$/, '').replace(/ \?$/, '')))];
     $('tAuto').title = S.autoStage1Done ? 'Changed maps: ' + (S.autoStage1Summary || 'none') : 'Changeable maps: ' + (eligible.length ? eligible.join(', ') : 'none detected');
   }
-  function autoStage1() {
-    if (!S.cur || S.autoStage1Done || !S.userOriginal) return;
-    S.autoStage1Done = true;
-    const deltas = [
-      [/^Boost target map/, 180], [/^Boost limit/, 180], [/^Torque limiter/, 1400],
-      [/^Drivers wish/, 330], [/^Smoke limiter\b/, 290], [/^Start of injection/, 80],
-      [/^N146 Pump voltage map/, 150], [/^N75 duty/, 195]
-    ];
-    let changed = 0, maps = 0; const changedNames = new Set();
-    for (const blk of S.cur.info.blocks) for (const m of blk.maps) {
+  // Stage 1 deltas. Each pair is [map-name match, increase at the map's peak
+  // cell]; the change scales proportionally for smaller cells.
+  const STAGE1_DELTAS = [
+    [/^Boost target map/, 180], [/^Boost limit/, 180], [/^Torque limiter/, 1400],
+    [/^Drivers wish/, 330], [/^Smoke limiter\b/, 290], [/^Start of injection/, 80],
+    [/^N146 Pump voltage map/, 150], [/^N75 duty/, 195]
+  ];
+  // Apply a delta profile to the given code blocks. Returns the number of cells
+  // changed and the distinct map names touched.
+  function applyStageDeltas(deltas, blocks) {
+    let changed = 0; const changedNames = new Set();
+    for (const blk of blocks) for (const m of blk.maps) {
       const hit = deltas.find(([re]) => re.test(m.name || '')); if (!hit || m.flat) continue;
-      const delta = hit[1]; let mapChanged = false;
+      const delta = hit[1];
       for (let k = 0; k < m.n1 * m.n2; k++) {
         const raw = MSA.rawData(S.cur.bin, m)[k];
         const current = m.signed ? MSA.s16(raw) : raw;
@@ -453,12 +457,19 @@
         if (current === 0 || (m.signed && current < 0)) continue;
         const scaled = Math.max(1, Math.round(delta * current / Math.max(1, m.max)));
         const lo = m.signed ? -32768 : 0, next = Math.max(lo, Math.min(m.signed ? 32767 : 65535, current + scaled));
-        if (next !== current) { MSA.setValue(S.cur.bin, m, Math.floor(k / m.n2), k % m.n2, next & 0xFFFF); changed++; mapChanged = true; }
+        if (next !== current) { MSA.setValue(S.cur.bin, m, Math.floor(k / m.n2), k % m.n2, next & 0xFFFF); changed++; changedNames.add(m.name.replace(/ \(\d+\)$/, '').replace(/ \?$/, '')); }
       }
-      if (mapChanged) { maps++; changedNames.add(m.name.replace(/ \(\d+\)$/, '').replace(/ \?$/, '')); }
     }
-    S.autoStage1Summary = [...changedNames].join(', ');
-    afterTune('Auto Stage 1 changed: ' + (S.autoStage1Summary || 'no recognized maps'), changed);
+    return { changed, names: [...changedNames] };
+  }
+  // One-shot original-to-Stage-1 tune. Honours the "All code blocks" scope
+  // checkbox like the other tuning buttons.
+  function autoStage1() {
+    if (!S.cur || S.autoStage1Done || !S.userOriginal) return;
+    S.autoStage1Done = true;
+    const res = applyStageDeltas(STAGE1_DELTAS, scopeBlocks());
+    S.autoStage1Summary = res.names.join(', ');
+    afterTune('Auto Stage 1 changed: ' + (S.autoStage1Summary || 'no recognized maps'), res.changed);
   }
   function afterTune(label, count) {
     if (!count) { toast(label + ': nothing changed (already set, or target not found).'); return; }
